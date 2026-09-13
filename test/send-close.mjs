@@ -8,7 +8,11 @@ import path from "node:path";
 import { tmpdir } from "node:os";
 import { unlinkSync } from "node:fs";
 
-const sock = path.join(tmpdir(), `pi-claude-link-sendclose-${process.pid}.sock`);
+// Unix socket in tmpdir, or a named pipe on Windows (no file to clean up there).
+const isWin = process.platform === "win32";
+const sock = isWin
+  ? String.raw`\\.\pipe\LOCAL\pi-claude-link-sendclose-` + process.pid
+  : path.join(tmpdir(), `pi-claude-link-sendclose-${process.pid}.sock`);
 let received = false;
 const server = await bindSocket(sock, () => { received = true; });
 
@@ -34,5 +38,5 @@ try {
   console.log(`FAIL: ${e.message} after ${Date.now() - t0}ms (listener held the socket half-open)`);
 }
 server.close();
-try { unlinkSync(sock); } catch { /* */ }
+if (!isWin) { try { unlinkSync(sock); } catch { /* */ } }
 process.exit(ok ? 0 : 1);

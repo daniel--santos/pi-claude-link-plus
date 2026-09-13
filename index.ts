@@ -13,19 +13,23 @@
 import type { AgentEndEvent, AgentMessage, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
-  ccSocksDir, bindSocket, registerPeer, updatePeer, deregisterPeer,
+  peerSockPath, bindSocket, registerPeer, updatePeer, deregisterPeer, newPeerToken, publishPeerKey,
   listClaudeSessions, resolveTarget, sendToClaude, stripEnvelope, receiptFrame, sendFrame,
   slugFromCwd, peerNameBySock,
 } from "./claude-protocol.ts";
 import path from "node:path";
+import { tmpdir } from "node:os";
 import { appendFileSync, existsSync } from "node:fs";
 import type { Server } from "node:net";
 
-// Debug logging: enabled by env PI_CLAUDE_LINK_DEBUG or the sentinel /tmp/pi-claude-link-debug.on
+// Debug logging: enabled by env PI_CLAUDE_LINK_DEBUG or the sentinel <tmpdir>/pi-claude-link-debug.on
 // (pi may not propagate env to extensions in all modes, so the sentinel is handy).
+// <tmpdir> is /tmp on Unix and %TEMP% on Windows.
+const DBG_ON = path.join(tmpdir(), "pi-claude-link-debug.on");
+const DBG_LOG = path.join(tmpdir(), "pi-claude-link-debug.log");
 const dbg = (...a: unknown[]) => {
-  if (!(process.env.PI_CLAUDE_LINK_DEBUG || existsSync("/tmp/pi-claude-link-debug.on"))) return;
-  try { appendFileSync("/tmp/pi-claude-link-debug.log", `[pi-claude-link ${new Date().toISOString()}] ${a.join(" ")}\n`); } catch { /* */ }
+  if (!(process.env.PI_CLAUDE_LINK_DEBUG || existsSync(DBG_ON))) return;
+  try { appendFileSync(DBG_LOG, `[pi-claude-link ${new Date().toISOString()}] ${a.join(" ")}\n`); } catch { /* */ }
 };
 
 interface AskWaiter { resolve: (body: string) => void; timer: NodeJS.Timeout; }
@@ -48,11 +52,19 @@ export default function piMeshExtension(pi: ExtensionAPI) {
     try { lastCtx?.ui.notify(m, level); } catch { /* no UI */ }
   };
 
+  // Name shown in Claude's /list-agents. Claude hides names no human chose, so a name
+  // set by the user (pi's session name, /claude-link name, or a rename from Claude)
+  // is registered as nameSource:"user"; the cwd-derived fallback stays "derived".
+  function setName(name: string) {
+    selfName = name;
+    try { pi.setSessionName(name); } catch { /* not supported in this mode */ }
+    updatePeer(pid, { name, nameSource: "user" }).catch(() => {});
+  }
+
   // ---- inbound: a peer frame arrived on our socket -------------------------
   function onFrame(frame: any): void {
     if (frame?.type === "control" && frame.action === "rename" && typeof frame.name === "string") {
-      selfName = frame.name;
-      updatePeer(pid, { name: frame.name }).catch(() => {});
+      setName(frame.name); // a human renamed us from the Claude side
       return;
     }
     if (frame?.type !== "user") return;
@@ -139,13 +151,20 @@ export default function piMeshExtension(pi: ExtensionAPI) {
     started = true;
     const cwd = ctx.cwd || process.cwd();
     const sessionId = ctx.sessionManager.getSessionId() || undefined;
-    selfName = pi.getSessionName() || `pi-${slugFromCwd(cwd)}`;
-    sockPath = path.join(ccSocksDir(), `${pid}.sock`);
-    ownFrom = `uds:${sockPath}`;
+    const userName = pi.getSessionName();
+    selfName = userName || `pi-${slugFromCwd(cwd)}`;
+    const nameSource = userName ? "user" : "derived";
+    sockPath = peerSockPath(pid); // Unix socket file, or a named pipe on Windows
+    ownFrom = `uds:${sockPath}`;  // Claude accepts uds:<pipe path> too
     try {
-      server = await bindSocket(sockPath, (frame) => onFrame(frame));
-      await registerPeer({ pid, sessionId, name: selfName, cwd, sockPath, status: "idle" });
-      dbg(`started name=${selfName} pid=${pid} sock=${sockPath} session=${sessionId}`);
+      // Bind with a fresh peer token, then publish it so Claude authenticates to us
+      // (Claude >= 2.1.266); if the key can't be published we stay a legacy peer.
+      const token = newPeerToken();
+      server = await bindSocket(sockPath, (frame) => onFrame(frame), { token });
+      const keyFile = await publishPeerKey({ pid, sockPath, token }).catch(() => undefined);
+      if (!keyFile) { server.close(); server = await bindSocket(sockPath, (frame) => onFrame(frame)); }
+      await registerPeer({ pid, sessionId, name: selfName, nameSource, cwd, sockPath, status: "idle" });
+      dbg(`started name=${selfName} pid=${pid} sock=${sockPath} session=${sessionId} key=${keyFile ?? "none"}`);
       notify(`pi-claude-link active as "${selfName}" — reachable from Claude Code /list-agents`, "info");
     } catch (e) {
       started = false;
@@ -234,8 +253,16 @@ export default function piMeshExtension(pi: ExtensionAPI) {
 
   // ---- convenience command -------------------------------------------------
   pi.registerCommand("claude-link", {
-    description: "List Claude Code sessions you can message (via the claude-link tool)",
-    handler: async (_args, ctx) => {
+    description: "List reachable Claude Code sessions; `name <name>` renames this session as Claude sees it",
+    handler: async (args, ctx) => {
+      const m = /^\s*name(?:\s+(.*))?$/s.exec(String(args ?? ""));
+      if (m) {
+        const name = (m[1] ?? "").trim().replace(/\s+/g, " ").slice(0, 64);
+        if (!name) { ctx.ui.notify(`Current name: "${selfName}". Usage: /claude-link name <name>`, "info"); return; }
+        setName(name);
+        ctx.ui.notify(`claude-link: this session is now "${name}" in Claude's /list-agents`, "info");
+        return;
+      }
       const rows = await listClaudeSessions({ excludeSock: sockPath });
       if (!rows.length) { ctx.ui.notify("No live Claude sessions found.", "info"); return; }
       ctx.ui.notify(`Reachable: ${rows.map((r) => r.name).join(", ")}`, "info");

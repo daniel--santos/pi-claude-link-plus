@@ -9,7 +9,7 @@
 import { readdir, readFile, mkdir, chmod, unlink, writeFile } from "node:fs/promises";
 import { readdirSync, readFileSync } from "node:fs";
 import { connect, createServer, type Server, type Socket } from "node:net";
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -17,6 +17,10 @@ import path from "node:path";
 export const HOME = homedir();
 export const CLAUDE_REGISTRY = path.join(HOME, ".claude", "sessions");
 export const MAX_LINE = 1024 * 1024; // Claude drops a connection past 1 MiB w/o newline
+export const IS_WIN = process.platform === "win32";
+
+/** Windows named-pipe path? Same test Claude uses (`\\.\pipe\`, `\\?\pipe\`, either slash). */
+export const isPipePath = (p: string): boolean => /^[\\/]{2}[.?][\\/]pipe[\\/]/i.test(p);
 
 export interface ClaudePeer {
   pid?: number;
@@ -42,10 +46,11 @@ export interface UserFrame {
 }
 
 /**
- * The directory Claude binds its own sockets in. We MUST co-locate ours there so
+ * (Unix) The directory Claude binds its own sockets in. We MUST co-locate ours there so
  * (1) Claude sends us delivery/hold receipts (it only replies to siblings of its
  * own socket), and (2) sandboxed peers (e.g. Codex's MCP server) can reach it.
  * Discovered from an existing registry entry rather than guessed from env.
+ * Not meaningful on Windows (named pipes have no directory) — use peerSockPath().
  */
 export function ccSocksDir(): string {
   try {
@@ -53,12 +58,24 @@ export function ccSocksDir(): string {
       if (!/^\d+\.json$/.test(f)) continue;
       let s: any;
       try { s = JSON.parse(readFileSync(path.join(CLAUDE_REGISTRY, f), "utf8")); } catch { continue; }
-      if (typeof s.messagingSocketPath === "string" && s.messagingSocketPath.endsWith(".sock"))
+      if (typeof s.messagingSocketPath === "string" && s.messagingSocketPath && !isPipePath(s.messagingSocketPath))
         return path.dirname(s.messagingSocketPath);
     }
   } catch { /* registry missing */ }
   const base = process.env.XDG_RUNTIME_DIR || "/tmp";
   return path.join(base, "cc-socks");
+}
+
+/**
+ * The endpoint this peer should bind for the given pid.
+ *  - Unix:    `<ccSocksDir()>/<pid>.sock` (a Unix domain socket next to Claude's).
+ *  - Windows: `\\.\pipe\LOCAL\cc-msg-<32 hex>` — the exact shape Claude Code uses for
+ *    its own pipes (verified against 2.1.270). Claude treats only this shape as a
+ *    canonical peer address, so we mirror it rather than invent our own name.
+ */
+export function peerSockPath(pid: number): string {
+  if (IS_WIN) return `\\\\.\\pipe\\LOCAL\\cc-msg-${randomBytes(16).toString("hex")}`;
+  return path.join(ccSocksDir(), `${pid}.sock`);
 }
 
 // ------------------------------------------------------------------ discovery
@@ -145,6 +162,100 @@ export function stripEnvelope(content: unknown): StrippedEnvelope {
   return { body: unescapeBody(m[2]), from: attrs["from"], fromName: attrs["from-name"], fromMode: attrs["from-mode"] };
 }
 
+// ----------------------------------------------------------------- peer auth
+//
+// Claude Code >= 2.1.266 authenticates peers with a per-session token instead of
+// trusting the socket alone (SO_PEERCRED doesn't exist for Windows named pipes):
+//   - each session publishes ~/.claude/sessions/<pid>.<sha256(canonical sock)>.key
+//     (mode 0600) containing { peerToken: <32 hex>, procStart | procStartFt, pidDomain? }
+//   - a sender looks up the TARGET's key by hashing the target's socket path and, if
+//     found, writes one auth line `{"type":"auth","token":"<peerToken>"}\n` before the
+//     frame. A receiver that published a key silently drops connections that don't.
+//   - no key for the target => legacy send, no auth line.
+// Reverse-engineered from Claude Code 2.1.270 (functions h_/u0/p0/Kwr/J$n/Jwr).
+
+const TOKEN_RE = /^[0-9a-f]{32}$/;
+const KEY_FILE_RE = /^(\d+)\.[0-9a-f]{64}\.key$/;
+const KEY_MAX_BYTES = 4096;
+
+export interface PeerKey { peerToken: string; procStart?: string; procStartFt?: string; pidDomain?: string; }
+
+/** The exact string Claude hashes for a socket path — must match byte-for-byte or the
+ *  key-file name differs and neither side finds the other's token.
+ *   - Windows pipe: `\\.\pipe\` + the pipe name (with `LOCAL\` if present), lower-cased.
+ *   - Unix: path.resolve(sock). */
+export function canonicalSockPath(sock: string): string | undefined {
+  const m = /^[\\/]{2}[.?][\\/]pipe[\\/](?:(LOCAL)[\\/])?([^\\/]+)$/i.exec(sock);
+  if (m) {
+    if (m[2] === "." || m[2] === ".." || /[. ]$/.test(m[2])) return undefined;
+    const name = m[1] === undefined ? m[2] : `LOCAL\\${m[2]}`;
+    return `\\\\.\\pipe\\${name.replace(/[A-Z]/g, (c) => c.toLowerCase())}`;
+  }
+  if (!sock || sock.startsWith("sid:")) return undefined;
+  return path.resolve(sock);
+}
+
+/** `<pid>.<sha256(canonical)>.key`, or undefined for a non-canonical socket path. */
+export function peerKeyFileName(pid: number, sock: string): string | undefined {
+  const canon = canonicalSockPath(sock);
+  if (canon === undefined) return undefined;
+  return `${pid}.${createHash("sha256").update(canon).digest("hex")}.key`;
+}
+
+export const newPeerToken = (): string => randomBytes(16).toString("hex");
+
+/** The auth preamble a sender writes before its first frame. */
+export const authLine = (token: string): string => JSON.stringify({ type: "auth", token }) + "\n";
+
+async function readPeerKey(file: string): Promise<PeerKey | undefined> {
+  try {
+    const raw = await readFile(file, "utf8");
+    if (raw.length > KEY_MAX_BYTES) return undefined;
+    const k = JSON.parse(raw);
+    return typeof k?.peerToken === "string" && TOKEN_RE.test(k.peerToken) ? k : undefined;
+  } catch { return undefined; }
+}
+
+const pidAlive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch (e: any) { return e?.code === "EPERM"; } };
+
+/** Find the token a sender must present to the session bound at `sock` (mirrors Claude's
+ *  lookup: any `*.<sha256(sock)>.key` in the registry; a live owner wins over a dead one).
+ *  undefined => the target published no key; send without auth. */
+export async function lookupPeerToken(sock: string): Promise<string | undefined> {
+  const canon = canonicalSockPath(sock);
+  if (canon === undefined) return undefined;
+  const suffix = `.${createHash("sha256").update(canon).digest("hex")}.key`;
+  let files: string[] = [];
+  try { files = await readdir(CLAUDE_REGISTRY); } catch { return undefined; }
+  let best: { alive: boolean; token: string } | undefined;
+  for (const f of files) {
+    if (!f.endsWith(suffix)) continue;
+    const m = KEY_FILE_RE.exec(f);
+    if (!m) continue;
+    const k = await readPeerKey(path.join(CLAUDE_REGISTRY, f));
+    if (!k) continue;
+    const alive = pidAlive(parseInt(m[1], 10));
+    if (!best || (alive && !best.alive)) best = { alive, token: k.peerToken };
+  }
+  return best?.token;
+}
+
+/** Publish our own key file so Claude authenticates to us (and so we can reject
+ *  unauthenticated connections). Returns the file path, or undefined if the socket
+ *  path is non-canonical (then we stay a legacy, token-less peer). */
+export async function publishPeerKey(o: { pid: number; sockPath: string; token: string }): Promise<string | undefined> {
+  const name = peerKeyFileName(o.pid, o.sockPath);
+  if (!name) return undefined;
+  await mkdir(CLAUDE_REGISTRY, { recursive: true, mode: 0o700 }).catch(() => {});
+  const start = await procStart(o.pid);
+  // Same field split Claude uses (y2): FILETIME goes in procStartFt on Windows.
+  const body: PeerKey = { peerToken: o.token, ...(IS_WIN ? { procStartFt: start } : { procStart: start }) };
+  const file = path.join(CLAUDE_REGISTRY, name);
+  await unlink(file).catch(() => {});
+  await writeFile(file, JSON.stringify(body), { mode: 0o600 });
+  return file;
+}
+
 // ------------------------------------------------------------------ wire I/O
 
 export function buildUserFrame(o: { content: string; from?: string; priority?: string; sessionId?: string }): UserFrame {
@@ -159,14 +270,18 @@ export function buildUserFrame(o: { content: string; from?: string; priority?: s
   };
 }
 
-/** Send one frame to a socket path (connect, write JSON+\n, close). */
-export function sendFrame(sock: string, frame: unknown, opts: { timeout?: number } = {}): Promise<string> {
+/** Send one frame to a socket path (connect, [auth line], write JSON+\n, close).
+ *  `opts.auth`: token to present; omitted => looked up from the target's key file
+ *  (see peer auth above); `false` => never send an auth line. */
+export async function sendFrame(sock: string, frame: unknown, opts: { timeout?: number; auth?: string | false } = {}): Promise<string> {
   const timeout = opts.timeout ?? 5000;
+  const token = opts.auth === false ? undefined : (opts.auth ?? await lookupPeerToken(sock));
+  const payload = (token ? authLine(token) : "") + JSON.stringify(frame) + "\n";
   return new Promise((resolve, reject) => {
     const c = connect({ path: sock });
     c.setTimeout(timeout, () => { c.destroy(); reject(new Error(`timed out connecting to ${sock}`)); });
     c.on("error", reject);
-    c.on("connect", () => c.end(JSON.stringify(frame) + "\n", () => resolve((frame as any).msg_id)));
+    c.on("connect", () => c.end(payload, () => resolve((frame as any).msg_id)));
   });
 }
 
@@ -195,15 +310,27 @@ export function receiptFrame(o: { status: string; from?: string; origMsgId?: str
  *  half-closes and resolves its send only when the socket fully CLOSES — timing out
  *  after 5s otherwise. If we held the connection half-open, every `SendMessage` to us
  *  would be reported as "Failed to send / Timed out" even though we received it. So we
- *  let the socket close (default allowHalfOpen:false) and also end our side on `end`. */
-export async function bindSocket(sockPath: string, onFrame: (frame: any, conn: Socket) => void): Promise<Server> {
-  const dir = path.dirname(sockPath);
-  await mkdir(dir, { recursive: true, mode: 0o700 }).catch(() => {});
-  await chmod(dir, 0o700).catch(() => {});
-  await unlink(sockPath).catch(() => {});
+ *  let the socket close (default allowHalfOpen:false) and also end our side on `end`.
+ *
+ *  `opts.token`: when set (and published via publishPeerKey), every connection must open
+ *  with a matching auth line or it is dropped — same rule Claude applies to us. */
+export async function bindSocket(
+  sockPath: string, onFrame: (frame: any, conn: Socket) => void, opts: { token?: string } = {},
+): Promise<Server> {
+  const pipe = isPipePath(sockPath);
+  if (!pipe) {
+    // Unix: the socket is a filesystem entry — make its dir private and clear stale files.
+    // Named pipes have neither a directory nor a file to unlink; `LOCAL\` scopes them to
+    // the current logon session, which is the equivalent of the 0o700/0o600 below.
+    const dir = path.dirname(sockPath);
+    await mkdir(dir, { recursive: true, mode: 0o700 }).catch(() => {});
+    await chmod(dir, 0o700).catch(() => {});
+    await unlink(sockPath).catch(() => {});
+  }
   const server = createServer((conn) => {
     conn.setEncoding("utf8");
     let buf = "";
+    let authed = !opts.token; // no token published => legacy peer, accept everything
     conn.on("data", (d: string) => {
       buf += d;
       if (buf.length > MAX_LINE) { conn.destroy(); buf = ""; return; }
@@ -212,6 +339,12 @@ export async function bindSocket(sockPath: string, onFrame: (frame: any, conn: S
         const line = buf.slice(0, i); buf = buf.slice(i + 1);
         if (!line.trim()) continue;
         let frame: any; try { frame = JSON.parse(line); } catch { continue; }
+        if (!authed) {
+          // First line must be the auth preamble carrying our token; anything else is dropped.
+          if (frame?.type === "auth" && frame.token === opts.token) { authed = true; continue; }
+          conn.destroy(); buf = ""; return;
+        }
+        if (frame?.type === "auth") continue; // already authed; ignore repeats
         try { onFrame(frame, conn); } catch { /* handler error */ }
       }
     });
@@ -224,22 +357,35 @@ export async function bindSocket(sockPath: string, onFrame: (frame: any, conn: S
     server.once("error", rej);
     server.listen(sockPath, () => { server.removeListener("error", rej); res(); });
   });
-  await chmod(sockPath, 0o600).catch(() => {});
+  if (!pipe) await chmod(sockPath, 0o600).catch(() => {});
   return server;
 }
 
 // ------------------------------------------------------------------- registry
 
-function procStart(pid: number): Promise<string | undefined> {
+/** Process start time, in the same representation Claude Code writes for its own
+ *  `procStart` on this platform (used to detect pid reuse):
+ *   - Unix:    `ps -o lstart` text, e.g. "Mon Sep 13 16:14:02 2026"
+ *   - Windows: creation time as a FILETIME (100 ns ticks since 1601), e.g. "134334483310213237" */
+export function procStart(pid: number): Promise<string | undefined> {
   return new Promise((res) => {
-    execFile("ps", ["-o", "lstart=", "-p", String(pid)], (err, out) =>
-      res(err ? undefined : out.trim() || undefined));
+    const done = (err: Error | null, out: string) => res(err ? undefined : out.trim() || undefined);
+    if (IS_WIN) {
+      execFile("powershell.exe",
+        ["-NoProfile", "-NonInteractive", "-Command", `(Get-Process -Id ${Number(pid)}).StartTime.ToFileTimeUtc()`],
+        { timeout: 5000, windowsHide: true }, done);
+    } else {
+      execFile("ps", ["-o", "lstart=", "-p", String(pid)], done);
+    }
   });
 }
 
 /** Write ~/.claude/sessions/<pid>.json so Claude lists this session as a peer. */
 export async function registerPeer(o: {
   pid: number; sessionId?: string; name: string; cwd: string; sockPath: string; status?: string;
+  /** "user" = a human chose the name (Claude's /list-agents shows it); "derived" = auto (shown
+   *  as "(unnamed session)" to humans, still addressable by the model). */
+  nameSource?: "user" | "derived";
 }): Promise<void> {
   await mkdir(CLAUDE_REGISTRY, { recursive: true }).catch(() => {});
   const entry = {
@@ -254,7 +400,7 @@ export async function registerPeer(o: {
     entrypoint: "pi",
     messagingSocketPath: o.sockPath,
     name: o.name,
-    nameSource: "derived",
+    nameSource: o.nameSource || "derived",
     status: o.status || "idle",
   };
   await writeFile(path.join(CLAUDE_REGISTRY, `${o.pid}.json`), JSON.stringify(entry, null, 2));
@@ -269,7 +415,11 @@ export async function updatePeer(pid: number, patch: Record<string, unknown>): P
 
 export async function deregisterPeer(pid: number, sockPath?: string): Promise<void> {
   await unlink(path.join(CLAUDE_REGISTRY, `${pid}.json`)).catch(() => {});
-  if (sockPath) await unlink(sockPath).catch(() => {});
+  if (!sockPath) return;
+  const key = peerKeyFileName(pid, sockPath);
+  if (key) await unlink(path.join(CLAUDE_REGISTRY, key)).catch(() => {});
+  // Named pipes vanish when the server closes; only Unix sockets leave a file behind.
+  if (!isPipePath(sockPath)) await unlink(sockPath).catch(() => {});
 }
 
 /** The display name Claude's /list-agents shows for the session bound to `sock`,

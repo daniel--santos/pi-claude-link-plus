@@ -43,5 +43,6 @@ await sleep(2500);
 try { child.kill("SIGKILL"); } catch { /* */ }
 await sleep(1500);
 console.log(piEntries().find((e) => e.pid === child.pid) ? "cleanup: STILL registered (bad)" : "cleanup: removed ✓");
-if (existsSync("/tmp/pi-claude-link-debug.log")) console.log("debug:\n" + readFileSync("/tmp/pi-claude-link-debug.log", "utf8"));
+const dbgLog = path.join(tmpdir(), "pi-claude-link-debug.log"); // same location the extension writes to
+if (existsSync(dbgLog)) console.log("debug:\n" + readFileSync(dbgLog, "utf8"));
 process.exit(mine ? 0 : 1);

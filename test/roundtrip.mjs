@@ -19,7 +19,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ---- throwaway "Claude" listener ----
 const lpid = process.pid;
-const lsock = path.join(P.ccSocksDir(), `${lpid}.sock`);
+const lsock = P.peerSockPath(lpid); // Unix socket next to Claude's, or a named pipe on Windows
 const received = [];
 await P.bindSocket(lsock, (frame) => {
   if (frame?.type === "user") {

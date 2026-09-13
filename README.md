@@ -25,7 +25,7 @@ pi-claude-link does pi↔Claude.
   - `claude-link({ action: "list" })` — list reachable Claude sessions
   - `claude-link({ action: "send", to, message })` — send; the reply comes back into this session
   - `claude-link({ action: "ask", to, message })` — send and block until the reply, returned as the tool result
-- **`/claude-link`** command to list sessions from the pi UI, plus a bundled skill so
+- **`/claude-link`** command to list sessions (and `/claude-link name <n>` to name this session for Claude's `/list-agents`) from the pi UI, plus a bundled skill so
   natural language ("message the other session…") just works.
 
 ## Requirements
@@ -37,8 +37,10 @@ pi-claude-link does pi↔Claude.
   a pi requirement, not specific to this extension.
 - **Claude Code with cross-session messaging enabled.** It's on by default in recent
   builds; if your Claude sessions don't appear in each other's `/list-agents`, start
-  them with `CLAUDE_CODE_HARBOR_KITE=1`. (pi-claude-link auto-discovers Claude's socket
-  directory — usually `/tmp/cc-socks` — and co-locates with it.)
+  them with `CLAUDE_CODE_HARBOR_KITE=1`. (On macOS/Linux pi-claude-link auto-discovers
+  Claude's socket directory — usually `/tmp/cc-socks` — and co-locates with it; on
+  Windows it binds a named pipe in the same `\\.\pipe\LOCAL\cc-msg-…` shape Claude uses.)
+- **OS:** macOS, Linux, and **Windows 11** (Claude Code ≥ 2.1.266 on Windows).
 
 ## Install
 
@@ -73,6 +75,11 @@ or `/claude-link` to list. Replies arrive back in your pi session automatically.
 SendMessage to pi-<dir>: "what's the test status?"
 ```
 
+> Claude's `/list-agents` UI only shows names a **human** chose; an auto-derived
+> `pi-<dir>` appears there as "(unnamed session)" (Claude itself can still address it).
+> Give the pi session a name so it shows up: `/claude-link name my-pi` in pi. A name set
+> before startup via pi's own session name is used too.
+
 The message appears in the pi session in real time; pi's answer is relayed back to
 your Claude session.
 
@@ -93,8 +100,16 @@ A single in-process TypeScript extension (`index.ts`) plus a dependency-free por
 Claude's wire protocol (`claude-protocol.ts`). No build step — pi runs TypeScript
 directly.
 
-- **`session_start`** → bind a Unix socket at `‹Claude's socket dir›/cc-socks/<pid>.sock`
-  and write `~/.claude/sessions/<pid>.json`, registering the pi session as a Claude peer.
+- **`session_start`** → bind a local endpoint — a Unix socket at
+  `‹Claude's socket dir›/cc-socks/<pid>.sock` on macOS/Linux, or a named pipe
+  `\\.\pipe\LOCAL\cc-msg-<32 hex>` on Windows — publish a peer key
+  (`~/.claude/sessions/<pid>.<sha256(socket)>.key`, mode 0600) and write
+  `~/.claude/sessions/<pid>.json`, registering the pi session as a Claude peer.
+- **peer auth** (Claude Code ≥ 2.1.266) → before every frame, the sender looks up the
+  *target's* key file by hashing the target's socket path and writes one
+  `{"type":"auth","token":…}` line; a receiver that published a key drops connections
+  without it. pi does both sides (sends auth to Claude, verifies auth from Claude). A
+  target with no key file gets a legacy, token-less send.
 - **inbound** (a `type:"user"` frame) → strip the `<cross-session-message>` envelope →
   `pi.sendUserMessage(...)` (real-time) + send a delivery receipt + record the sender.
   The sender's display name is resolved from Claude's registry so it matches `/list-agents`.
@@ -102,7 +117,8 @@ directly.
 - **`claude-link` tool** → `list` reads Claude's registry (live-filtered); `send`/`ask`
   connect to the target's socket and write a peer frame; replies route back to our
   socket and are injected.
-- **`session_shutdown`** → unlink the socket and remove the registry entry.
+- **`session_shutdown`** → close the endpoint (unlinking the socket file on Unix) and
+  remove the registry entry and key file.
 
 There's no broker or daemon — **Claude's session registry is the hub.** Anything else
 registered in that hub is also visible to `list`.
@@ -116,8 +132,12 @@ Messages between agents are **peer input, not user authority**:
 - On the **pi** side, injected messages are framed *"from another agent, not your
   user"* — the model is instructed to treat them as peer requests and not as your
   approval.
-- Sockets are `0600` inside a `0700` directory: the boundary is your **user account**
-  (a same-user process could already reach these).
+- Sockets are `0600` inside a `0700` directory (Unix), and named pipes live under
+  `\\.\pipe\LOCAL\`, scoped to your logon session (Windows): the boundary is your
+  **user account** (a same-user process could already reach these).
+- Peer tokens live in `0600` key files in `~/.claude/sessions/`; presenting one proves
+  the sender can read your files — the same "same user" boundary, enforced on the
+  wire (this is what replaces `SO_PEERCRED` for named pipes).
 - **Do not wire this extension to external/automated inputs.** It is a path for
   untrusted content to reach a permissioned agent — keep the input side to things a
   human sends.
@@ -128,22 +148,39 @@ Extensions are plain TypeScript run in-process (no build). The `test/` harnesses
 a real pi rpc session end-to-end; run them under a pi-compatible Node:
 
 ```bash
+npm test                  # transport unit tests (no pi needed): endpoint + send/close
 # override how pi is launched if `pi` on PATH isn't on a new enough Node:
 #   export PI_CMD="/path/to/node22 /path/to/pi/dist/cli.js"
-node --experimental-strip-types test/reg-test.mjs     # registration + cleanup
-node --experimental-strip-types test/roundtrip.mjs    # inbound relay + outbound tool
+npm run test:reg          # registration + cleanup (launches a real pi rpc session)
+npm run test:roundtrip    # inbound relay + outbound tool
 ```
 
-`dev-run.sh` launches pi with the extension loaded for interactive testing.
+`dev-run.sh` (bash) / `dev-run.ps1` (PowerShell) launch pi with the extension loaded
+for interactive testing.
 
-Enable debug logging with `PI_CLAUDE_LINK_DEBUG=1` (or `touch
-/tmp/pi-claude-link-debug.on`); logs go to `/tmp/pi-claude-link-debug.log`.
+Enable debug logging with `PI_CLAUDE_LINK_DEBUG=1` or by creating a sentinel file in
+your temp dir (`touch /tmp/pi-claude-link-debug.on`, or on Windows
+`New-Item "$env:TEMP\pi-claude-link-debug.on"`); logs go to
+`<tmpdir>/pi-claude-link-debug.log`.
 
 ## Compatibility
 
-Verified against **pi-coding-agent 0.80.6** and **Claude Code 2.1.224**. The Claude
-side relies on its cross-session messaging protocol; if a future Claude release
-changes it, `claude-protocol.ts` is the single place to update.
+Verified against **pi-coding-agent 0.80.6** and **Claude Code 2.1.224** (macOS/Linux),
+and **pi-coding-agent 0.85.1** / **Claude Code 2.1.270** on **Windows 11**. Claude Code
+**≥ 2.1.266** requires the peer-auth handshake described above; older builds ignore the
+key files and still work. The Claude side relies on its cross-session messaging
+protocol; if a future Claude release changes it, `claude-protocol.ts` is the single
+place to update.
+
+Platform differences are confined to `claude-protocol.ts`:
+
+| | macOS / Linux | Windows |
+|---|---|---|
+| Endpoint | Unix socket `‹cc-socks›/<pid>.sock` | Named pipe `\\.\pipe\LOCAL\cc-msg-<32 hex>` |
+| Peer address | `uds:/…/<pid>.sock` | `uds:\\.\pipe\LOCAL\cc-msg-…` |
+| Key-file hash input | `path.resolve(socket)` | `\\.\pipe\local\cc-msg-…` (lower-cased) |
+| `procStart` | `ps -o lstart` text (`procStart`) | FILETIME via `Get-Process` (`procStartFt` in the key file) |
+| Debug files | `/tmp/pi-claude-link-debug.*` | `%TEMP%\pi-claude-link-debug.*` |
 
 ## More
 
