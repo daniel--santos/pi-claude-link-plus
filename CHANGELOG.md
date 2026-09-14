@@ -7,6 +7,12 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **`@`-mention Claude sessions in the pi editor.** Typing `@` offers the live Claude
+  sessions (before the built-in file matches; names with spaces complete as
+  `@"…"`). On submit, a mentioned session adds a hidden context note so the model
+  delivers with `claude-link` (`send`/`ask`) to that exact name — the same mechanism
+  as Claude Code's `@session`. `findMentions` / `mentionPrefix` / `mentionToken` in
+  `claude-protocol.ts`, tested by `test/mentions.mjs`.
 - **Peer authentication (Claude Code ≥ 2.1.266).** Claude now drops frames from peers
   that don't present its per-session token. pi publishes its own
   `~/.claude/sessions/<pid>.<sha256(socket)>.key`, verifies the `{"type":"auth"}`

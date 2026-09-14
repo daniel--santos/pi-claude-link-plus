@@ -438,6 +438,38 @@ export function peerNameBySock(sock: string): string | undefined {
   return undefined;
 }
 
+// ------------------------------------------------------------------- mentions
+
+/** Session names @-mentioned in `text`, resolved against `names` (the live sessions).
+ *  A mention is `@name` or `@"name with spaces"` at a token boundary; only names that
+ *  exactly match (then case-insensitively) a live session count, so `@src/file.ts`
+ *  keeps meaning a file. Returns the matched live names, deduplicated, in order. */
+export function findMentions(text: string, names: string[]): string[] {
+  const out: string[] = [];
+  const byLower = new Map(names.map((n) => [n.toLowerCase(), n]));
+  const re = /(^|[\s(\[{,;:])@(?:"([^"\n]+)"|([^\s@"]+))/g;
+  for (const m of text.matchAll(re)) {
+    const raw = (m[2] ?? m[3] ?? "").trim();
+    if (!raw) continue;
+    // allow trailing punctuation on the bare form: "@pi-001," / "@pi-001?"
+    const candidates = m[2] !== undefined ? [raw] : [raw, raw.replace(/[.,;:!?)\]}]+$/, "")];
+    for (const c of candidates) {
+      const hit = names.includes(c) ? c : byLower.get(c.toLowerCase());
+      if (hit) { if (!out.includes(hit)) out.push(hit); break; }
+    }
+  }
+  return out;
+}
+
+/** The `@…` token to complete: text after the last whitespace if it starts with `@`. */
+export function mentionPrefix(textBeforeCursor: string): string | null {
+  const m = /(?:^|\s)(@(?:"[^"\n]*|[^\s@"]*))$/.exec(textBeforeCursor);
+  return m ? m[1] : null;
+}
+
+/** How a name must be written after `@` to survive tokenization. */
+export const mentionToken = (name: string): string => /[\s"]/.test(name) ? `@"${name.replace(/"/g, "")}"` : `@${name}`;
+
 export function slugFromCwd(cwd: string): string {
   const base = path.basename(cwd || "pi") || "pi";
   return base.replace(/[^a-zA-Z0-9._-]/g, "-").slice(0, 32);

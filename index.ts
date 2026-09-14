@@ -15,7 +15,7 @@ import { Type } from "typebox";
 import {
   peerSockPath, bindSocket, registerPeer, updatePeer, deregisterPeer, newPeerToken, publishPeerKey,
   listClaudeSessions, resolveTarget, sendToClaude, stripEnvelope, receiptFrame, sendFrame,
-  slugFromCwd, peerNameBySock,
+  slugFromCwd, peerNameBySock, findMentions, mentionPrefix, mentionToken,
 } from "./claude-protocol.ts";
 import path from "node:path";
 import { tmpdir } from "node:os";
@@ -177,10 +177,66 @@ export default function piMeshExtension(pi: ExtensionAPI) {
     await deregisterPeer(pid, sockPath).catch(() => {});
   }
 
-  pi.on("session_start", async (_e, ctx) => { await start(ctx); });
+  pi.on("session_start", async (_e, ctx) => { await start(ctx); installMentions(ctx); });
   pi.on("turn_start", async (_e, ctx) => { lastCtx = ctx; if (!started) await start(ctx); });
   pi.on("agent_end", async (event, ctx) => { lastCtx = ctx; relayReply(event); });
   pi.on("session_shutdown", async () => { await stop(); });
+
+  // ---- @mentions: complete Claude session names, hint the model on submit --
+  // Mirrors Claude Code's own @session behaviour: typing `@` offers the live Claude
+  // sessions (alongside the built-in file matches); when a submitted message mentions
+  // one, a note is appended telling the model to deliver it with the claude-link tool.
+  let mentionsInstalled = false;
+  function installMentions(ctx: ExtensionContext) {
+    if (mentionsInstalled) return;
+    mentionsInstalled = true;
+    try {
+      ctx.ui.addAutocompleteProvider((current) => ({
+        triggerCharacters: Array.from(new Set([...(current.triggerCharacters ?? []), "@"])),
+        async getSuggestions(lines, cursorLine, cursorCol, options) {
+          const before = (lines[cursorLine] || "").slice(0, cursorCol);
+          const prefix = mentionPrefix(before);
+          const base = await current.getSuggestions(lines, cursorLine, cursorCol, options);
+          if (prefix === null) return base;
+          const q = prefix.replace(/^@"?/, "").toLowerCase();
+          const rows = await listClaudeSessions({ excludeSock: sockPath }).catch(() => []);
+          const mine = rows
+            .filter((r) => r.name.toLowerCase().includes(q))
+            .map((r) => ({ value: mentionToken(r.name), label: `@${r.name}`, description: `Claude Code · ${r.status} · ${r.cwd}` }));
+          // Our items first; the built-in file matches keep working after them.
+          const items = [...mine, ...(base && base.prefix === prefix ? base.items : [])];
+          return items.length ? { items, prefix } : base;
+        },
+        // The built-in `@` completion already inserts `value + " "`, which is what we want.
+        applyCompletion: (lines, cursorLine, cursorCol, item, prefix) => current.applyCompletion(lines, cursorLine, cursorCol, item, prefix),
+        ...(current.shouldTriggerFileCompletion && {
+          shouldTriggerFileCompletion: (lines: string[], l: number, c: number) => current.shouldTriggerFileCompletion!(lines, l, c),
+        }),
+      }));
+    } catch (e) { dbg(`autocomplete provider not available: ${(e as Error).message}`); }
+  }
+
+  // On submit: if the prompt @-mentions live Claude sessions, add a hidden context note
+  // (like Claude Code's own system reminder) — the user's message itself is untouched.
+  pi.on("before_agent_start", async (ev) => {
+    if (!ev.prompt.includes("@")) return;
+    const rows = await listClaudeSessions({ excludeSock: sockPath }).catch(() => []);
+    const names = findMentions(ev.prompt, rows.map((r) => r.name));
+    if (!names.length) return;
+    const list = names.map((n) => `"${n}"`).join(", ");
+    dbg(`@mention -> ${list}`);
+    return {
+      message: {
+        customType: "claude-link-mention",
+        display: false,
+        content:
+          `The user @-mentioned the Claude Code session(s) ${list}, live on this machine. ` +
+          `If their message asks you to tell or ask that session something, deliver it with the claude-link tool — ` +
+          `action:"send" to fire-and-forget (the reply arrives in this session later) or action:"ask" to wait for the answer — ` +
+          `with to: set to exactly one of those names. Do not message a session unless the message actually asks you to.`,
+      },
+    };
+  });
 
   // ---- outbound: the model-facing tool ------------------------------------
   const PARAMS = Type.Object({

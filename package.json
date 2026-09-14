@@ -23,11 +23,12 @@
     ]
   },
   "scripts": {
-    "test": "npm run test:pipe && npm run test:send-close",
+    "test": "npm run test:pipe && npm run test:mentions && npm run test:send-close",
     "test:pipe": "node --experimental-strip-types test/win-pipe.mjs",
     "test:send-close": "node --experimental-strip-types test/send-close.mjs",
     "test:reg": "node --experimental-strip-types test/reg-test.mjs",
-    "test:roundtrip": "node --experimental-strip-types test/roundtrip.mjs"
+    "test:roundtrip": "node --experimental-strip-types test/roundtrip.mjs",
+    "test:mentions": "node --experimental-strip-types test/mentions.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

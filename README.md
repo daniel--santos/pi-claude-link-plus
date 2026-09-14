@@ -68,6 +68,11 @@ message claude-code-7b: build passes → calls claude-link({action:"send", ...})
 
 or `/claude-link` to list. Replies arrive back in your pi session automatically.
 
+**`@`-mention a session** (like Claude Code's own `@session`): type `@` in the pi
+editor and the live Claude sessions are offered alongside file matches — `@link ask
+what the build status is`. The model gets a hidden note naming the mentioned session
+and delivers with `claude-link` (`send` or `ask`); `@src/file.ts` still means a file.
+
 **From Claude → pi** (in a Claude Code session):
 
 ```
