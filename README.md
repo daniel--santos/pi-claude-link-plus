@@ -171,7 +171,7 @@ your temp dir (`touch /tmp/pi-claude-link-debug.on`, or on Windows
 ## Compatibility
 
 Verified against **pi-coding-agent 0.80.6** and **Claude Code 2.1.224** (macOS/Linux),
-and **pi-coding-agent 0.85.1** / **Claude Code 2.1.270** on **Windows 11**. Claude Code
+and **pi-coding-agent 0.85.1** / **Claude Code 2.1.270–2.1.272** on **Windows 11**. Claude Code
 **≥ 2.1.266** requires the peer-auth handshake described above; older builds ignore the
 key files and still work. The Claude side relies on its cross-session messaging
 protocol; if a future Claude release changes it, `claude-protocol.ts` is the single
@@ -190,7 +190,7 @@ Platform differences are confined to `claude-protocol.ts`:
 ## Hacking guide — everything you need to change the code or add features
 
 Claude Code's cross-session protocol is undocumented; what follows was reverse-engineered
-from Claude Code **2.1.270** (Windows 11) and verified live, so you don't have to
+from Claude Code **2.1.270** (Windows 11), re-checked unchanged on **2.1.272**, and verified live, so you don't have to
 rediscover it. Function names in parentheses are the minified names in that build —
 useful when grepping the binary.
 
@@ -272,7 +272,7 @@ It never errors — the frame just vanishes. To interoperate:
      prepend `\\.\pipe\` → e.g. `\\.\pipe\local\cc-msg-0123…`; then `sha256` → hex.
    - Unix: `path.resolve(sock)`; then `sha256`.
    - File: `<pid>.<hex>.key`. `canonicalSockPath` / `peerKeyFileName` implement this and
-     were checked against 16/16 real key files (2.1.266 and 2.1.270).
+     were checked against 35/35 real key files (2.1.266 – 2.1.272).
 2. **Sending** (`Kwr`): list the registry, pick files ending in `.<hex>.key` for the
    target socket, read `peerToken`; if several pids share the hash prefer a live owner.
    No key → legacy send without the auth line (older Claude builds, or peers like the

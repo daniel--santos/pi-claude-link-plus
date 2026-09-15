@@ -26,7 +26,7 @@ All notable changes to this project are documented here. The format follows
 - **Windows 11 support.** On Windows the peer endpoint is a named pipe in the same
   `\\.\pipe\LOCAL\cc-msg-<32 hex>` shape Claude Code binds itself (`peerSockPath()`),
   and `procStart` is written as a FILETIME via `Get-Process`, matching Claude's own
-  registry entries. Verified against Claude Code 2.1.270.
+  registry entries. Verified against Claude Code 2.1.270 – 2.1.272.
 - `npm test` — transport unit tests (`test/win-pipe.mjs`) that need neither pi nor
   Claude; `test:reg` / `test:roundtrip` scripts for the e2e harnesses.
 - `dev-run.ps1` for PowerShell.

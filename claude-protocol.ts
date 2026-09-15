@@ -70,7 +70,7 @@ export function ccSocksDir(): string {
  * The endpoint this peer should bind for the given pid.
  *  - Unix:    `<ccSocksDir()>/<pid>.sock` (a Unix domain socket next to Claude's).
  *  - Windows: `\\.\pipe\LOCAL\cc-msg-<32 hex>` — the exact shape Claude Code uses for
- *    its own pipes (verified against 2.1.270). Claude treats only this shape as a
+ *    its own pipes (verified against 2.1.270 – 2.1.272). Claude treats only this shape as a
  *    canonical peer address, so we mirror it rather than invent our own name.
  */
 export function peerSockPath(pid: number): string {
@@ -172,7 +172,8 @@ export function stripEnvelope(content: unknown): StrippedEnvelope {
 //     found, writes one auth line `{"type":"auth","token":"<peerToken>"}\n` before the
 //     frame. A receiver that published a key silently drops connections that don't.
 //   - no key for the target => legacy send, no auth line.
-// Reverse-engineered from Claude Code 2.1.270 (functions h_/u0/p0/Kwr/J$n/Jwr).
+// Reverse-engineered from Claude Code 2.1.270 (functions h_/u0/p0/Kwr/J$n/Jwr); identical
+// in 2.1.272 (renamed ib/eB/tB/·/Dqn/Z0r) — only minified names moved.
 
 const TOKEN_RE = /^[0-9a-f]{32}$/;
 const KEY_FILE_RE = /^(\d+)\.[0-9a-f]{64}\.key$/;
