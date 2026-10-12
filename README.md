@@ -260,7 +260,27 @@ and resolves only when the socket fully **closes** (5 s timeout) — so a receiv
  "status":"delivered","reason":"…","from":"uds:<our sock>","orig_msg_id":"<their msg_id>"}
 // Claude renamed us (a human used /rename on a peer) — update name + nameSource:"user"
 {"type":"control","action":"rename","name":"…"}
+// idle subscription — only sent to peers whose registry entry lists
+// peerFeatures:["notify_idle"] (else Claude reports "peer-unsupported")
+{"type":"control","action":"notify_when_idle","from":"uds:<their sock>","from_mode":"…?",
+ "msgV":1,"msg_id":"<uuid>"}
+// the one notice per subscription (send it to `from`)
+{"type":"control","action":"peer_idle_notice","orig_msg_id":"<subscription msg_id>",
+ "state":"idle"|"exited"|"unavailable","finished_at":<epoch ms, optional>,
+ "detail":"<optional>","from":"uds:<our sock>","msgV":1,"msg_id":"<uuid>"}
 ```
+
+Idle-notice rules (Claude 2.1.296, mirrored by `IdleSubscriptions`): already idle →
+notice after a 750 ms debounce, no `finished_at`; busy → when the turn ends, with
+`finished_at` = end of turn; shutdown → `exited`; over the 32-subscriber cap or after
+exit → `unavailable`; one live subscription per subscriber; the subscriber gives up
+after 12 h. Claude adds `detail` (its last turn text) only for pid-verified, same-mode
+subscribers — never on Windows — so pi omits it. Claude correlates by `orig_msg_id`
+only and shows the notice as `[Cross-session idle notice] "<name>" … is idle now` at
+its next turn boundary (not mid-turn), or only in the user's transcript when the
+`crossSessionInbound` gate holds the sender's permission class. `peerFeatures` also
+has `artifact_yield` (handing artifact-comment replies between sessions); pi doesn't
+implement it.
 
 `content` is wrapped in an envelope: `<cross-session-message from="uds:…" from-name="…"
 from-mode="…">\n<body>\n</cross-session-message>`, with `</cross-session-message` inside
@@ -368,8 +388,9 @@ Techniques that worked:
 ### 10. Ideas / extension points
 
 - Honor Claude's `childToken` (subagent senders) and `pidDomain`.
-- `notify_when_idle`-style subscriptions and `status` updates (`updatePeer(pid, {status})`
-  on `turn_start`/`agent_end`).
+- Live `status` updates (`updatePeer(pid, { status, statusUpdatedAt })` on
+  `agent_start`/`agent_end`) so Claude's `/list-agents` shows pi as busy/idle.
+- `artifact_yield` (the other `peerFeatures` entry Claude advertises).
 - A `hold` gate on the pi side mirroring `crossSessionInbound: "hold"`.
 - `sid:` stable addresses once Claude ships them by default.
 
