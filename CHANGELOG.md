@@ -7,6 +7,14 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Idle notices (`notify_idle`).** pi advertises `peerFeatures: ["notify_idle"]` and
+  answers Claude's `notify_when_idle` subscriptions with exactly one `peer_idle_notice`
+  (`idle` when its turn ends, `exited` on shutdown, `unavailable` over the 32-subscriber
+  cap or after exit), so `SendMessage(..., notify_when_idle: true)` works against pi
+  sessions instead of reporting `peer-unsupported`. `IdleSubscriptions`,
+  `parseIdleSubscription`, `idleNoticeFrame`, `PEER_FEATURES` in `claude-protocol.ts`;
+  `registerPeer({ peerFeatures })`. Tested by `test/idle.mjs`; verified live against
+  Claude Code 2.1.296.
 - **`@`-mention Claude sessions in the pi editor.** Typing `@` offers the live Claude
   sessions (before the built-in file matches; names with spaces complete as
   `@"…"`). On submit, a mentioned session adds a hidden context note so the model

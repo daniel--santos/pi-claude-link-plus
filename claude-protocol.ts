@@ -362,6 +362,153 @@ export async function bindSocket(
   return server;
 }
 
+// ------------------------------------------------------------ idle notices
+//
+// Claude's SendMessage({ notify_when_idle: true }) asks a peer for ONE notice when it next
+// goes idle (or exits). Claude only subscribes to peers that list "notify_idle" in
+// peerFeatures in their registry entry (otherwise it reports "peer-unsupported").
+//   subscribe  → {type:"control", action:"notify_when_idle", from:"uds:<their sock>",
+//                 from_mode?, msgV:1, msg_id}
+//   notice     ← {type:"control", action:"peer_idle_notice", orig_msg_id:<subscribe msg_id>,
+//                 state:"idle"|"exited"|"unavailable", finished_at?:<epoch ms>, detail?,
+//                 from:"uds:<our sock>", msgV:1, msg_id}
+// Already idle at subscribe time → notice after a 750 ms debounce; busy → when the turn ends
+// (finished_at = end of that turn). Shutdown → "exited". Over the 32-subscriber cap or after
+// exit → "unavailable". Claude only sends "detail" (last turn text) to pid-verified peers,
+// which never happens on Windows, so we never send it. Reverse-engineered from 2.1.296.
+
+/** Features we advertise in the registry (Claude's own list also has "artifact_yield"). */
+export const PEER_FEATURES = ["notify_idle"] as const;
+
+export type IdleState = "idle" | "exited" | "unavailable";
+
+export function idleNoticeFrame(o: { origMsgId: string; state: IdleState; from?: string; finishedAt?: number }) {
+  return {
+    type: "control",
+    action: "peer_idle_notice",
+    orig_msg_id: o.origMsgId,
+    state: o.state,
+    ...(o.finishedAt !== undefined && { finished_at: o.finishedAt }),
+    ...(o.from && { from: o.from }),
+    msgV: 1,
+    msg_id: randomUUID(),
+  };
+}
+
+/** A well-formed inbound notify_when_idle subscription, or undefined. */
+export function parseIdleSubscription(frame: any): { replyTo: string; origMsgId: string } | undefined {
+  if (frame?.action !== "notify_when_idle" || (frame.type !== undefined && frame.type !== "control")) return undefined;
+  if (typeof frame.msg_id !== "string" || !frame.msg_id) return undefined;
+  if (typeof frame.from !== "string" || !frame.from.startsWith("uds:")) return undefined;
+  const replyTo = frame.from.slice(4);
+  return canonicalSockPath(replyTo) === undefined ? undefined : { replyTo, origMsgId: frame.msg_id };
+}
+
+interface IdleSub { replyTo: string; key: string; origMsgId: string; at: number; }
+
+export type IdleNoticeSender = (replyTo: string, frame: ReturnType<typeof idleNoticeFrame>) => Promise<unknown>;
+
+export interface IdleSubscriptionOptions {
+  from: () => string;                 // our uds: address
+  ownSock: () => string;              // to drop self-targeted subscriptions
+  isIdle?: () => boolean | undefined; // host probe at fire time (defers while false)
+  cap?: number; debounceMs?: number; ttlMs?: number;
+}
+
+/** One-shot idle subscriptions, mirroring Claude's own peer-idle tracker. Pure (no pi deps):
+ *  the host reports busy/idle transitions and supplies the transport. */
+export class IdleSubscriptions {
+  private subs: IdleSub[] = [];
+  private timer: ReturnType<typeof setTimeout> | undefined;
+  private idle = true;
+  private idleSince = Date.now();
+  private turnEnded = false;
+  private exited = false;
+  private readonly cap: number;
+  private readonly debounceMs: number;
+  private readonly ttlMs: number;
+  private readonly send: IdleNoticeSender;
+  private readonly opts: IdleSubscriptionOptions;
+
+  constructor(send: IdleNoticeSender, opts: IdleSubscriptionOptions) {
+    this.send = send;
+    this.opts = opts;
+    this.cap = opts.cap ?? 32;
+    this.debounceMs = opts.debounceMs ?? 750;
+    this.ttlMs = opts.ttlMs ?? 12 * 60 * 60 * 1000; // Claude expires its side after 12 h
+  }
+
+  get size(): number { return this.subs.length; }
+
+  /** Record a subscription. Returns what happened (for logging). */
+  subscribe(replyTo: string, origMsgId: string): "recorded" | "refreshed" | "self" | "unavailable" | "invalid" {
+    const key = canonicalSockPath(replyTo);
+    if (key === undefined) return "invalid";
+    if (key === canonicalSockPath(this.opts.ownSock())) return "self";
+    if (this.exited) { void this.notify(replyTo, origMsgId, "unavailable"); return "unavailable"; }
+    this.prune();
+    // One live subscription per subscriber: a newer one replaces the older (Claude clears its
+    // other outstanding subscriptions to the same target when any notice arrives).
+    const i = this.subs.findIndex((s) => s.key === key);
+    if (i !== -1) this.subs.splice(i, 1);
+    else if (this.subs.length >= this.cap) { void this.notify(replyTo, origMsgId, "unavailable"); return "unavailable"; }
+    this.subs.push({ replyTo, key, origMsgId, at: Date.now() });
+    if (this.idle) this.schedule();
+    return i === -1 ? "recorded" : "refreshed";
+  }
+
+  /** A turn started. */
+  setBusy(): void {
+    this.idle = false;
+    if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
+  }
+
+  /** A turn finished. */
+  setIdle(): void {
+    if (this.idle) return;
+    this.idle = true;
+    this.idleSince = Date.now();
+    this.turnEnded = true;
+    if (this.subs.length) this.schedule();
+  }
+
+  /** Session is shutting down: tell every pending subscriber, then answer new ones "unavailable". */
+  async exit(): Promise<void> {
+    if (this.exited) return;
+    this.exited = true;
+    if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
+    const subs = this.take();
+    const at = Date.now();
+    await Promise.all(subs.map((s) => this.notify(s.replyTo, s.origMsgId, "exited", at)));
+  }
+
+  private schedule(ms = this.debounceMs): void {
+    if (this.timer) return;
+    this.timer = setTimeout(() => { this.timer = undefined; void this.fire(); }, ms);
+    this.timer.unref?.();
+  }
+
+  private async fire(): Promise<void> {
+    if (!this.idle || this.exited || !this.subs.length) return;
+    if (this.opts.isIdle?.() === false) { this.schedule(); return; } // queued continuation
+    const subs = this.take();
+    const finishedAt = this.turnEnded ? this.idleSince : undefined;
+    await Promise.all(subs.map((s) => this.notify(s.replyTo, s.origMsgId, "idle", finishedAt)));
+  }
+
+  private take(): IdleSub[] { this.prune(); return this.subs.splice(0); }
+
+  private prune(): void {
+    const cutoff = Date.now() - this.ttlMs;
+    this.subs = this.subs.filter((s) => s.at >= cutoff);
+  }
+
+  private notify(replyTo: string, origMsgId: string, state: IdleState, finishedAt?: number): Promise<void> {
+    return this.send(replyTo, idleNoticeFrame({ origMsgId, state, finishedAt, from: this.opts.from() }))
+      .then(() => {}, () => {}); // best effort: the subscriber expires its side on its own
+  }
+}
+
 // ------------------------------------------------------------------- registry
 
 /** Process start time, in the same representation Claude Code writes for its own
@@ -387,6 +534,8 @@ export async function registerPeer(o: {
   /** "user" = a human chose the name (Claude's /list-agents shows it); "derived" = auto (shown
    *  as "(unnamed session)" to humans, still addressable by the model). */
   nameSource?: "user" | "derived";
+  /** Optional protocol features this peer implements (e.g. PEER_FEATURES). */
+  peerFeatures?: readonly string[];
 }): Promise<void> {
   await mkdir(CLAUDE_REGISTRY, { recursive: true }).catch(() => {});
   const entry = {
@@ -403,6 +552,7 @@ export async function registerPeer(o: {
     name: o.name,
     nameSource: o.nameSource || "derived",
     status: o.status || "idle",
+    ...(o.peerFeatures?.length && { peerFeatures: [...o.peerFeatures] }),
   };
   await writeFile(path.join(CLAUDE_REGISTRY, `${o.pid}.json`), JSON.stringify(entry, null, 2));
 }

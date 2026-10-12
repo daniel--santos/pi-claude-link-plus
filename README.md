@@ -119,6 +119,12 @@ directly.
   `pi.sendUserMessage(...)` (real-time) + send a delivery receipt + record the sender.
   The sender's display name is resolved from Claude's registry so it matches `/list-agents`.
 - **`agent_end`** → relay pi's reply back to the recorded sender(s).
+- **idle notices** → pi advertises `peerFeatures: ["notify_idle"]`, so Claude's
+  `SendMessage(..., notify_when_idle: true)` works against it: Claude sends a
+  `notify_when_idle` control frame, and pi answers once with `peer_idle_notice` —
+  `idle` when its turn ends (after a 750 ms debounce, with `finished_at`), `exited` if
+  it shuts down first, `unavailable` if it can't hold the subscription. Claude shows it
+  as `[Cross-session idle notice] "<pi name>" … is idle now` on its next turn.
 - **`claude-link` tool** → `list` reads Claude's registry (live-filtered); `send`/`ask`
   connect to the target's socket and write a peer frame; replies route back to our
   socket and are injected.

@@ -16,6 +16,7 @@ import {
   peerSockPath, bindSocket, registerPeer, updatePeer, deregisterPeer, newPeerToken, publishPeerKey,
   listClaudeSessions, resolveTarget, sendToClaude, stripEnvelope, receiptFrame, sendFrame,
   slugFromCwd, peerNameBySock, findMentions, mentionPrefix, mentionToken,
+  IdleSubscriptions, parseIdleSubscription, PEER_FEATURES,
 } from "./claude-protocol.ts";
 import path from "node:path";
 import { tmpdir } from "node:os";
@@ -41,6 +42,14 @@ export default function piMeshExtension(pi: ExtensionAPI) {
   let ownFrom = "";
   let selfName = "";
   const pid = process.pid;
+  // Claude's SendMessage({notify_when_idle}) subscriptions: one notice when our turn ends.
+  const idleSubs = new IdleSubscriptions(
+    (sock, frame) => sendFrame(sock, frame).then(
+      (id) => { dbg(`idle notice ${frame.state} -> ${sock}`); return id; },
+      (e) => { dbg(`idle notice ${frame.state} -> ${sock} failed: ${(e as Error).message}`); throw e; },
+    ),
+    { from: () => ownFrom, ownSock: () => sockPath, isIdle: () => lastCtx?.isIdle?.() },
+  );
   let lastCtx: ExtensionContext | undefined;
 
   // Senders awaiting a relayed reply (their uds: addresses), populated on inbound.
@@ -65,6 +74,11 @@ export default function piMeshExtension(pi: ExtensionAPI) {
   function onFrame(frame: any): void {
     if (frame?.type === "control" && frame.action === "rename" && typeof frame.name === "string") {
       setName(frame.name); // a human renamed us from the Claude side
+      return;
+    }
+    const sub = parseIdleSubscription(frame);
+    if (sub) {
+      dbg(`notify_when_idle from ${sub.replyTo}: ${idleSubs.subscribe(sub.replyTo, sub.origMsgId)}`);
       return;
     }
     if (frame?.type !== "user") return;
@@ -101,6 +115,9 @@ export default function piMeshExtension(pi: ExtensionAPI) {
     try {
       // sendUserMessage always triggers a turn; when busy, steer into the current one.
       pi.sendUserMessage(framed, idle ? undefined : { deliverAs: "steer" });
+      // A turn is now on its way: an idle subscription riding along with this message
+      // must wait for that turn to end, even if agent_start is slow to fire.
+      idleSubs.setBusy();
       if (fromAddr.startsWith("uds:")) pendingReplies.add(fromAddr);
       ackDelivered(fromAddr, frame.msg_id);
       notify(`claude-link: message from ${who}`, "info");
@@ -163,7 +180,7 @@ export default function piMeshExtension(pi: ExtensionAPI) {
       server = await bindSocket(sockPath, (frame) => onFrame(frame), { token });
       const keyFile = await publishPeerKey({ pid, sockPath, token }).catch(() => undefined);
       if (!keyFile) { server.close(); server = await bindSocket(sockPath, (frame) => onFrame(frame)); }
-      await registerPeer({ pid, sessionId, name: selfName, nameSource, cwd, sockPath, status: "idle" });
+      await registerPeer({ pid, sessionId, name: selfName, nameSource, cwd, sockPath, status: "idle", peerFeatures: PEER_FEATURES });
       dbg(`started name=${selfName} pid=${pid} sock=${sockPath} session=${sessionId} key=${keyFile ?? "none"}`);
       notify(`pi-claude-link active as "${selfName}" — reachable from Claude Code /list-agents`, "info");
     } catch (e) {
@@ -173,13 +190,16 @@ export default function piMeshExtension(pi: ExtensionAPI) {
   }
 
   async function stop() {
+    // Tell idle subscribers we're leaving before the socket and registry entry go away.
+    await Promise.race([idleSubs.exit(), new Promise((r) => setTimeout(r, 1500))]).catch(() => {});
     try { server?.close(); } catch { /* */ }
     await deregisterPeer(pid, sockPath).catch(() => {});
   }
 
   pi.on("session_start", async (_e, ctx) => { await start(ctx); installMentions(ctx); });
   pi.on("turn_start", async (_e, ctx) => { lastCtx = ctx; if (!started) await start(ctx); });
-  pi.on("agent_end", async (event, ctx) => { lastCtx = ctx; relayReply(event); });
+  pi.on("agent_start", async (_e, ctx) => { lastCtx = ctx; idleSubs.setBusy(); });
+  pi.on("agent_end", async (event, ctx) => { lastCtx = ctx; relayReply(event); idleSubs.setIdle(); });
   pi.on("session_shutdown", async () => { await stop(); });
 
   // ---- @mentions: complete Claude session names, hint the model on submit --
