@@ -114,7 +114,10 @@ export default function piMeshExtension(pi: ExtensionAPI) {
     dbg(`inbound from ${who} (${fromAddr}) idle=${idle}: ${env.body.slice(0, 60)}`);
     try {
       // sendUserMessage always triggers a turn; when busy, steer into the current one.
-      pi.sendUserMessage(framed, idle ? undefined : { deliverAs: "steer" });
+      // Always pass deliverAs: pi ignores it while idle, and since pi 1.5 a run that is
+      // still starting counts as busy and rejects a message without it (two frames
+      // arriving back to back would lose the second).
+      pi.sendUserMessage(framed, { deliverAs: "steer" });
       // A turn is now on its way: an idle subscription riding along with this message
       // must wait for that turn to end, even if agent_start is slow to fire.
       idleSubs.setBusy();
@@ -239,9 +242,12 @@ export default function piMeshExtension(pi: ExtensionAPI) {
   // On submit: if the prompt @-mentions live Claude sessions, add a hidden context note
   // (like Claude Code's own system reminder) — the user's message itself is untouched.
   pi.on("before_agent_start", async (ev) => {
-    if (!ev.prompt.includes("@")) return;
+    // Since pi 1.5 this also fires for runs started by a custom message
+    // (messageType "custom"), which carry no prompt.
+    const prompt = "prompt" in ev ? ev.prompt : undefined;
+    if (typeof prompt !== "string" || !prompt.includes("@")) return;
     const rows = await listClaudeSessions({ excludeSock: sockPath }).catch(() => []);
-    const names = findMentions(ev.prompt, rows.map((r) => r.name));
+    const names = findMentions(prompt, rows.map((r) => r.name));
     if (!names.length) return;
     const list = names.map((n) => `"${n}"`).join(", ");
     dbg(`@mention -> ${list}`);

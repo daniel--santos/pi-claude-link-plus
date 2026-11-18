@@ -39,6 +39,16 @@ All notable changes to this project are documented here. The format follows
   Claude; `test:reg` / `test:roundtrip` scripts for the e2e harnesses.
 - `dev-run.ps1` for PowerShell.
 
+### Fixed
+- **pi ≥ 1.5:** the `@`-mention `before_agent_start` handler threw
+  (`Cannot read properties of undefined (reading 'includes')`) for runs started by a
+  custom message (`pi.sendMessage(..., { triggerTurn: true })`), which carry no
+  `prompt`; it now only looks at user prompts.
+- **pi ≥ 1.5:** inbound Claude messages are always injected with `deliverAs: "steer"`.
+  pi now counts a starting run as busy and rejects a message without `deliverAs`, so a
+  second message arriving right after the first (both seen as idle) was dropped even
+  though a "delivered" receipt had been sent. pi ignores `deliverAs` while idle.
+
 ### Changed
 - `isPipePath()` / `IS_WIN` in `claude-protocol.ts`; `bindSocket` and `deregisterPeer`
   skip `mkdir`/`chmod`/`unlink` for named pipes.

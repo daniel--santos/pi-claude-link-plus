@@ -177,7 +177,8 @@ your temp dir (`touch /tmp/pi-claude-link-debug.on`, or on Windows
 ## Compatibility
 
 Verified against **pi-coding-agent 0.80.6** and **Claude Code 2.1.224** (macOS/Linux),
-and **pi-coding-agent 0.85.1** / **Claude Code 2.1.270–2.1.272** on **Windows 11**. Claude Code
+and **pi-coding-agent 0.85.1** / **Claude Code 2.1.270** through **pi-coding-agent 1.5.2** /
+**Claude Code 2.1.327** on **Windows 11**. Claude Code
 **≥ 2.1.266** requires the peer-auth handshake described above; older builds ignore the
 key files and still work. The Claude side relies on its cross-session messaging
 protocol; if a future Claude release changes it, `claude-protocol.ts` is the single
@@ -334,8 +335,8 @@ Types: `@earendil-works/pi-coding-agent/dist/core/extensions/types.d.ts`
 | `pi.on("session_start" \| "turn_start")` | bind + register (once) |
 | `pi.on("agent_end", ev.messages)` | relay the last assistant text to pending senders |
 | `pi.on("session_shutdown")` | close endpoint, remove `.json` + `.key` |
-| `pi.on("before_agent_start") → { message: { customType, content, display:false } }` | hidden per-turn context (the @mention note). Prefer this over `pi.on("input") → transform`, which rewrites the user's visible message |
-| `pi.sendUserMessage(text, { deliverAs: "steer" })` | inject an inbound message (steer when busy) |
+| `pi.on("before_agent_start") → { message: { customType, content, display:false } }` | hidden per-turn context (the @mention note). Prefer this over `pi.on("input") → transform`, which rewrites the user's visible message. Since pi 1.5 the event is a union on `messageType`: `"custom"` runs (started by `pi.sendMessage(..., { triggerTurn: true })`) have **no `prompt`** — guard with `"prompt" in ev` |
+| `pi.sendUserMessage(text, { deliverAs: "steer" })` | inject an inbound message. **Always pass `deliverAs`**: pi ignores it while idle, and since pi 1.5 a run that is still starting counts as busy and rejects a message without it (the error is reported asynchronously, so a `try/catch` around the call never sees it) |
 | `pi.registerTool` / `pi.registerCommand(name, { handler(args, ctx) })` | `claude-link` tool and `/claude-link [name …]` |
 | `pi.getSessionName()` / `pi.setSessionName()` | our display name → `nameSource` |
 | `ctx.ui.addAutocompleteProvider(current => provider)` | stack session names on the built-in `@` file completion; the built-in `applyCompletion` already inserts `value + " "` |
