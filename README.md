@@ -177,8 +177,8 @@ your temp dir (`touch /tmp/pi-claude-link-debug.on`, or on Windows
 ## Compatibility
 
 Verified against **pi-coding-agent 0.80.6** and **Claude Code 2.1.224** (macOS/Linux),
-and **pi-coding-agent 0.85.1** / **Claude Code 2.1.270** through **pi-coding-agent 1.5.2** /
-**Claude Code 2.1.327** on **Windows 11**. Claude Code
+and **pi-coding-agent 0.85.1** / **Claude Code 2.1.270** through **pi-coding-agent 1.6.0** /
+**Claude Code 2.1.330** on **Windows 11**. Claude Code
 **≥ 2.1.266** requires the peer-auth handshake described above; older builds ignore the
 key files and still work. The Claude side relies on its cross-session messaging
 protocol; if a future Claude release changes it, `claude-protocol.ts` is the single
